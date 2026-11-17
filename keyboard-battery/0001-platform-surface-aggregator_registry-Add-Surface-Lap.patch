@@ -1,5 +1,5 @@
 From 5df2e2d3b4fa61e5684d618ef9df6517658706b9 Mon Sep 17 00:00:00 2001
-From: YOUR NAME <your@email>
+From: Andrea Della Corte <andrea@dellacorte.me>
 Date: Mon, 16 Nov 2026 22:33:30 +0000
 Subject: [PATCH] platform/surface: aggregator_registry: Add Surface Laptop 7
  for Business (Intel)
@@ -27,7 +27,7 @@ Note: this device also has an ACPI MSHW0551 device (\_SB_.WSID); binding
 the hub to either works, MSHW0005 was chosen as it is the \_SB_.SLT_
 node. Happy to switch if MSHW0551 is preferred.
 
-Signed-off-by: YOUR NAME <YOUR EMAIL>
+Signed-off-by: Andrea Della Corte <andrea@dellacorte.me>
 ---
  .../surface/surface_aggregator_registry.c         | 15 +++++++++++++++
  1 file changed, 15 insertions(+)
