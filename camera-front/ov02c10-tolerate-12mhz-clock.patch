@@ -1,0 +1,15 @@
+--- a/drivers/media/i2c/ov02c10.c
++++ b/drivers/media/i2c/ov02c10.c
+@@ -893,9 +893,9 @@
+ 
+ 	freq = clk_get_rate(ov02c10->img_clk);
+ 	if (freq != OV02C10_MCLK)
+-		return dev_err_probe(ov02c10->dev, -EINVAL,
+-				     "external clock %lu is not supported",
+-				     freq);
++		dev_info(ov02c10->dev,
++			 "external clock %lu differs from expected %u; proceeding anyway\n",
++			 freq, OV02C10_MCLK);
+ 
+ 	v4l2_i2c_subdev_init(&ov02c10->sd, client, &ov02c10_subdev_ops);
+ 

@@ -1,0 +1,206 @@
+#!/usr/bin/python3 -I
+# Surface IR face-auth daemon (root). Protocol: one line per connection on
+# /run/surface-faceauth.sock (root:wheel 0660), one reply line:
+#   status   <user>            -> YES | NO
+#   precheck <user> <service>  -> STARTED      (face check in background + notification)
+#   approve  <user> <service>  -> OK | FAIL ..  (needs a physical Enter press in the last 2 s)
+#   wait     <user> <service>  -> OK | FAIL ..  (lock screen: wait for activity, then check)
+import glob, grp, os, pwd, re, select, socket, struct, subprocess, sys, threading, time
+
+SOCK = "/run/surface-faceauth.sock"
+MODEL_DIR = "/usr/lib/security/howdy/models"
+RECOG_VALID_S = 30      # a precheck result is usable this long
+ENTER_WINDOW_S = 2.0    # approve needs a physical Enter press this recently
+WAIT_MAX_S = 60
+IGNORE_FIRST_S = 1.0
+EV_KEY, EV_REL, EV_ABS, EV_SW, SW_LID, KEY_ENTER, KEY_KPENTER = 1, 2, 3, 5, 0, 28, 96
+EVFMT = "llHHi"; EVSZ = struct.calcsize(EVFMT)
+ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/bin"}
+
+def log(*a): print(*a, file=sys.stderr, flush=True)
+
+# ---------------- input watcher ----------------
+state = {"enter": 0.0, "activity": 0.0}
+cond = threading.Condition()
+
+def lid_closed():
+    return any("closed" in open(f).read() for f in glob.glob("/proc/acpi/button/lid/*/state"))
+
+def input_watcher():
+    fds = {}
+    last_scan = 0
+    while True:
+        if time.monotonic() - last_scan > 5:          # pick up hotplugged devices
+            last_scan = time.monotonic()
+            for p in glob.glob("/dev/input/event*"):
+                if p not in fds.values():
+                    try: fds[os.open(p, os.O_RDONLY | os.O_NONBLOCK)] = p
+                    except OSError: pass
+        r, _, _ = select.select(list(fds), [], [], 5)
+        for fd in r:
+            try: data = os.read(fd, EVSZ * 64)
+            except OSError:
+                os.close(fd); fds.pop(fd, None); continue
+            now = time.monotonic(); enter = act = False
+            for i in range(0, len(data) - EVSZ + 1, EVSZ):
+                _, _, typ, code, val = struct.unpack_from(EVFMT, data, i)
+                if typ == EV_KEY and val == 1:
+                    act = True
+                    if code in (KEY_ENTER, KEY_KPENTER): enter = True
+                elif typ in (EV_REL, EV_ABS) or (typ == EV_SW and code == SW_LID and val == 0):
+                    act = True
+            if act or enter:
+                with cond:
+                    if act: state["activity"] = now
+                    if enter: state["enter"] = now
+                    cond.notify_all()
+
+# ---------------- face check ----------------
+check_lock = threading.Lock()
+recog = {}            # user -> monotonic time of last successful check
+pending = {}          # user -> threading.Event of a running precheck
+
+def snapshot(user):
+    """Grab the IR frame the camera sees right now (bridge running) for the notification."""
+    try:
+        pw = pwd.getpwnam(user)
+        d = f"/run/user/{pw.pw_uid}"
+        if not os.path.isdir(d): return None
+        path = f"{d}/faceauth-{int(time.time() * 1000)}.png"
+        subprocess.run(["timeout", "4", "ffmpeg", "-loglevel", "error", "-y", "-f", "v4l2",
+                        "-i", "/dev/video51", "-frames:v", "1", "-vf",
+                        "crop=440:440:100:80,scale=256:256,eq=contrast=1.35:brightness=0.03,vignette=PI/4.5",
+                        path], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.isfile(path): return None
+        os.chown(path, pw.pw_uid, pw.pw_gid); os.chmod(path, 0o600)
+        for old in sorted(glob.glob(f"{d}/faceauth-*.png"))[:-3]:   # keep the last 3
+            os.unlink(old)
+        return path
+    except Exception as e:
+        log("snapshot failed:", e)
+        return None
+
+def face_check(user):
+    """-> (rc, snapshot path or None); rc 0 = recognised."""
+    with check_lock:
+        if lid_closed(): return 97, None
+        try:
+            if subprocess.run(["surface-ir-bridge", "start", "15"], env=ENV).returncode != 0:
+                return 98, None
+            rc = subprocess.run(["timeout", "10", "python3", "/usr/lib/security/howdy/compare.py", user],
+                                env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            return rc, snapshot(user)
+        finally:
+            subprocess.run(["surface-ir-bridge", "stop"], env=ENV)
+
+def notify(user, title, body, image=None, ok=True):
+    """Show the face toast (a fresh Quickshell overlay, so it stacks above the polkit dialog)."""
+    try:
+        pw = pwd.getpwnam(user)
+        rt = f"/run/user/{pw.pw_uid}"
+        wl = sorted(p for p in glob.glob(f"{rt}/wayland-*") if not p.endswith(".lock"))
+        if not wl: return
+        env = {"PATH": ENV["PATH"], "HOME": pw.pw_dir, "XDG_RUNTIME_DIR": rt,
+               "WAYLAND_DISPLAY": os.path.basename(wl[0]),
+               "DBUS_SESSION_BUS_ADDRESS": f"unix:path={rt}/bus",
+               "FACE_TITLE": title, "FACE_BODY": body, "FACE_IMAGE": image or "",
+               "FACE_OK": "1" if ok else "0"}
+        subprocess.Popen(["runuser", "-u", user, "--", "env", *[f"{k}={v}" for k, v in env.items()],
+                          "timeout", "15", "quickshell", "-p", "/usr/local/lib/surface-faceauth/toast"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        log("toast failed:", e)
+
+WHAT = {"sudo": "sudo", "polkit-1": "the administrator action"}
+
+def run_precheck(user, service, done):
+    rc, snap = face_check(user)
+    if rc == 0:
+        recog[user] = time.monotonic()
+        notify(user, "Face recognised", f"Press Enter to approve {WHAT.get(service, service)}", snap)
+    else:
+        notify(user, "Face not recognised", "Type your password instead", snap, ok=False)
+    log(f"precheck {user} {service}: rc={rc}")
+    done.set()
+
+# ---------------- requests ----------------
+def handle(conn):
+    try:
+        conn.settimeout(2)
+        line = conn.makefile().readline().split()
+        cmd, user, service = (line + ["", "", ""])[:3]
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+            return conn.sendall(b"FAIL user\n")
+        has_model = os.path.isfile(f"{MODEL_DIR}/{user}.dat")
+        if cmd == "status":
+            return conn.sendall(b"YES\n" if has_model else b"NO\n")
+        if not has_model:
+            return conn.sendall(b"FAIL nomodel\n")
+
+        if cmd == "precheck":
+            if user not in pending or pending[user].is_set():
+                pending[user] = threading.Event()
+                threading.Thread(target=run_precheck, args=(user, service, pending[user]), daemon=True).start()
+            return conn.sendall(b"STARTED\n")
+
+        if cmd == "approve":
+            with cond:
+                physical = time.monotonic() - state["enter"] <= ENTER_WINDOW_S
+            if not physical:
+                log(f"approve {user} {service}: refused, no physical Enter press")
+                return conn.sendall(b"FAIL nophysical\n")
+            ev = pending.get(user)
+            if ev and not ev.is_set():
+                ev.wait(12)                              # precheck still running: wait for it
+            t = recog.pop(user, None)
+            if t is not None and time.monotonic() - t <= RECOG_VALID_S:
+                log(f"approve {user} {service}: OK (precheck)")
+                return conn.sendall(b"OK\n")
+            rc, _ = face_check(user)                     # no recent result: check now
+            log(f"approve {user} {service}: rc={rc}")
+            return conn.sendall(b"OK\n" if rc == 0 else f"FAIL {rc}\n".encode())
+
+        if cmd == "wait":
+            start = time.monotonic(); deadline = start + WAIT_MAX_S
+            conn.settimeout(0.5)
+            while True:
+                with cond:
+                    cond.wait(0.5)
+                    triggered = state["activity"] > start + IGNORE_FIRST_S
+                if triggered and not lid_closed():
+                    break
+                if time.monotonic() > deadline:
+                    return conn.sendall(b"FAIL idle\n")
+                try:
+                    if conn.recv(1, socket.MSG_PEEK) == b"": return   # client gone
+                except socket.timeout:
+                    pass
+            rc, snap = face_check(user)
+            log(f"wait {user} {service}: rc={rc}")
+            if rc == 0:
+                conn.sendall(b"OK\n")
+                notify(user, "Face recognised", "Welcome back", snap)
+            else:
+                conn.sendall(f"FAIL {rc}\n".encode())
+            return
+        conn.sendall(b"FAIL cmd\n")
+    except Exception as e:
+        log("request error:", e)
+    finally:
+        conn.close()
+
+def main():
+    threading.Thread(target=input_watcher, daemon=True).start()
+    try: os.unlink(SOCK)
+    except FileNotFoundError: pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    os.chown(SOCK, 0, grp.getgrnam("wheel").gr_gid)
+    os.chmod(SOCK, 0o660)
+    srv.listen(8)
+    log("faceauthd ready")
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+main()

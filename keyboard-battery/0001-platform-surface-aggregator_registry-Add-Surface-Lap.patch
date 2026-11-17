@@ -1,0 +1,70 @@
+From 5df2e2d3b4fa61e5684d618ef9df6517658706b9 Mon Sep 17 00:00:00 2001
+From: YOUR NAME <your@email>
+Date: Mon, 16 Nov 2026 22:33:30 +0000
+Subject: [PATCH] platform/surface: aggregator_registry: Add Surface Laptop 7
+ for Business (Intel)
+
+The Surface Laptop for Business 7th Edition (Intel) exposes its SSAM
+platform hub as ACPI device MSHW0005 (\_SB_.SLT_), which is not yet
+known to the registry. As a result, no SSAM client devices are created:
+the built-in keyboard does not work and the battery and AC adapter are
+not reported.
+
+Add the device ID along with a node group for this model. Unlike the
+ARM-based Surface Laptop 7, battery and AC are SSAM devices here. The
+following have been tested on this device (SAM firmware 11.103.139):
+
+ - battery (surface_battery) and AC adapter (surface_ac)
+ - platform profile (surface_platform_profile) and fan (surface_fan)
+ - HID keyboard (SAM, TID=1, IID=1)
+ - HID sensor collection (SAM, TID=1, IID=6)
+
+The touchpad and touchscreen are attached via THC/QuickSPI and I2C and
+do not need SSAM client devices. The TID=2 HID keyboard used by earlier
+Surface Laptop generations is not present (probe times out).
+
+Note: this device also has an ACPI MSHW0551 device (\_SB_.WSID); binding
+the hub to either works, MSHW0005 was chosen as it is the \_SB_.SLT_
+node. Happy to switch if MSHW0551 is preferred.
+
+Signed-off-by: YOUR NAME <YOUR EMAIL>
+---
+ .../surface/surface_aggregator_registry.c         | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/drivers/platform/surface/surface_aggregator_registry.c b/drivers/platform/surface/surface_aggregator_registry.c
+index cf3ae25..be892ef 100644
+--- a/drivers/platform/surface/surface_aggregator_registry.c
++++ b/drivers/platform/surface/surface_aggregator_registry.c
+@@ -302,6 +302,18 @@ static const struct software_node *ssam_node_group_sl7[] = {
+ 	NULL,
+ };
+ 
++/* Devices for Surface Laptop 7 (Intel). */
++static const struct software_node *ssam_node_group_sl7_intel[] = {
++	&ssam_node_root,
++	&ssam_node_bat_ac,
++	&ssam_node_bat_main,
++	&ssam_node_tmp_perf_profile_with_fan,
++	&ssam_node_fan_speed,
++	&ssam_node_hid_sam_keyboard,
++	&ssam_node_hid_sam_sensors,
++	NULL,
++};
++
+ /* Devices for Surface Laptop Studio 1. */
+ static const struct software_node *ssam_node_group_sls1[] = {
+ 	&ssam_node_root,
+@@ -503,6 +515,9 @@ static const struct acpi_device_id ssam_platform_hub_acpi_match[] = {
+ 	/* Surface Laptop Studio 2 */
+ 	{ "MSHW0360", (unsigned long)ssam_node_group_sls2 },
+ 
++	/* Surface Laptop for Business 7th Edition (Intel) */
++	{ "MSHW0005", (unsigned long)ssam_node_group_sl7_intel },
++
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(acpi, ssam_platform_hub_acpi_match);
+-- 
+2.56.0
+

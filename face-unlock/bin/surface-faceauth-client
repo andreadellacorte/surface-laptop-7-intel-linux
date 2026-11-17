@@ -1,0 +1,28 @@
+#!/usr/bin/python3 -I
+# pam_exec helper for the Surface face-auth daemon.
+#   precheck: start a background face check when the prompt appears (never blocks)
+#   approve:  password submitted empty (expose_authtok) -> approve with face
+#   lock:     lock screen; waits for activity, then checks
+#   status:   is a face model enrolled
+import os, socket, sys
+mode = sys.argv[1] if len(sys.argv) > 1 else "lock"
+user = os.environ.get("PAM_USER") or (sys.argv[2] if len(sys.argv) > 2 else "")
+if not user:
+    sys.exit(1)
+if mode == "approve":
+    tok = sys.stdin.buffer.read(4096) if not sys.stdin.isatty() else b""
+    if tok.strip(b"\0\r\n"):
+        sys.exit(1)          # a password was typed: let pam_unix handle it
+if mode == "lock":
+    print("Press a key or touch the touchpad to unlock with your face", flush=True)
+service = os.environ.get("PAM_SERVICE", mode)
+cmd = {"lock": "wait"}.get(mode, mode)
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5 if mode in ("precheck", "status") else 90)
+    s.connect("/run/surface-faceauth.sock")
+    s.sendall(f"{cmd} {user} {service}\n".encode())
+    resp = s.makefile().readline().strip()
+except OSError:
+    sys.exit(1)
+sys.exit(0 if resp in ("OK", "YES") else 1)

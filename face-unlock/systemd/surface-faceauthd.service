@@ -1,0 +1,10 @@
+[Unit]
+Description=Surface IR face authentication daemon (Howdy)
+After=systemd-udevd.service
+
+[Service]
+ExecStart=/usr/local/lib/surface-faceauth/faceauthd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

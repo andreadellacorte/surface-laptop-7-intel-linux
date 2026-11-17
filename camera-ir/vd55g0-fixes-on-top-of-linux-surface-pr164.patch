@@ -1,0 +1,349 @@
+--- a/drivers/media/i2c/vd55g0.c
++++ b/drivers/media/i2c/vd55g0.c
+@@ -139,12 +139,34 @@
+ #define VD55G0_DARKCAL_PEDESTAL_DEF			0x40
+ #define VD55G0_EXPO_MAX_TERM				64
+ #define VD55G0_EXPO_DEF					200
++
++/*
++ * Surface Laptop 7 (Intel) IR flood emitter, reverse-engineered from the
++ * Windows vd55g0.sys: all four sensor GPIOs in strobe mode (emitter on GPIO1),
++ * strobe timing block 0x0470-0x0479, manual exposure 644 lines (~33% duty).
++ * Longer exposure keeps the strobe on too long and the emitter's eye-safety
++ * circuit cuts out, so exposure is clamped while the emitter is enabled.
++ */
++#define VD55G0_IR_EXPO_DEF				644
++#define VD55G0_IR_EXPO_MAX				644
++#define VD55G0_IR_AGAIN_DEF				0x18
++#define VD55G0_IR_DGAIN_DEF				0x0100	/* 1x: libcamera AGC does not drive digital gain */
++static bool ir_emitter = true;
++module_param(ir_emitter, bool, 0444);
++MODULE_PARM_DESC(ir_emitter, "Drive the IR flood emitter while streaming (default: on)");
+ #define VD55G0_LINE_LENGTH_SLOW				1200
+ #define VD55G0_LINE_LENGTH_FAST				1128
+ 
+ #define V4L2_CID_TEMPERATURE			(V4L2_CID_USER_BASE | 0x1020)
+ #define V4L2_CID_DARKCAL_PEDESTAL		(V4L2_CID_USER_BASE | 0x1021)
+ #define V4L2_CID_SLAVE				(V4L2_CID_USER_BASE | 0x1022)
++/* Experimental: bitmask of sensor GPIOs (0-3) to drive in STROBE mode (IR emitter) */
++#define V4L2_CID_IR_LED_MASK			(V4L2_CID_USER_BASE | 0x1023)
++/* Raw GPIO0_CTRL value; Windows uses 0x12 = emitter on, 0x05 = off */
++#define V4L2_CID_IR_GPIO0_RAW			(V4L2_CID_USER_BASE | 0x1024)
++/* Debug: byte register access while the sensor is powered (streaming) */
++#define V4L2_CID_DBG_REG_ADDR			(V4L2_CID_USER_BASE | 0x1025)
++#define V4L2_CID_DBG_REG_VAL			(V4L2_CID_USER_BASE | 0x1026)
+ 
+ #include "vd55g0_patches.h"
+ 
+@@ -172,7 +194,7 @@
+  */
+ static const char * const vd55g0_supply_name[] = {
+ 	"avdd",
+-	"pwr2",
++	"dovdd",  /* mainline int3472 name for GPIO type 0x10 */
+ };
+ 
+ static const s64 link_freq[] = {
+@@ -298,6 +320,7 @@
+ 	struct media_pad pad;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(vd55g0_supply_name)];
+ 	struct gpio_desc *reset_gpio;
++	struct gpio_desc *powerdown_gpio;
+ 	struct clk *xclk;
+ 	u32 clk_freq;
+ 	u16 oif_ctrl;
+@@ -335,6 +358,8 @@
+ 	struct vd55g0_gpios gpios;
+ 	bool is_slave;
+ 	bool flash_en;
++	u32 dbg_addr;
++	u32 gpio0_raw;	/* raw GPIO0_CTRL value (IR emitter), 0 = untouched */
+ 	struct {
+ 		u16 expo;
+ 		u16 digital_gain;
+@@ -521,10 +546,13 @@
+ 	}
+ 	return -ETIMEDOUT;
+ #else
+-	return read_poll_timeout(vd55g0_read_reg, ret,
+-				 ((ret < 0) || (ret == poll_val)),
+-				 loop_delay_ms * 1000, timeout_ms * 1000,
+-				 false, sensor, reg);
++	{
++		int err = read_poll_timeout(vd55g0_read_reg, ret,
++					    ((ret < 0) || (ret == poll_val)),
++					    loop_delay_ms * 1000, timeout_ms * 1000,
++					    false, sensor, reg);
++		return err ? err : (ret < 0 ? ret : 0);
++	}
+ #endif
+ }
+ 
+@@ -631,7 +659,8 @@
+ 
+ 	switch (index) {
+ 	case V4L2_EXPOSURE_AUTO:
+-		sensor->expo_state = VD55G0_EXP_AUTO;
++		/* sensor AE runs exposure up to the frame length: unsafe for the emitter */
++		sensor->expo_state = ir_emitter ? VD55G0_EXP_MANUAL : VD55G0_EXP_AUTO;
+ 		break;
+ 	case V4L2_EXPOSURE_MANUAL:
+ 		sensor->expo_state = VD55G0_EXP_MANUAL;
+@@ -745,6 +774,8 @@
+ 
+ static int vd55g0_update_exposure(struct vd55g0_dev *sensor, int expo_ms)
+ {
++	if (ir_emitter && expo_ms > VD55G0_IR_EXPO_MAX)
++		expo_ms = VD55G0_IR_EXPO_MAX;
+ 	sensor->manual_expo = expo_ms;
+ 	if (sensor->streaming)
+ 		return vd55g0_write_reg(sensor,
+@@ -952,12 +983,48 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (ir_emitter) {
++		for (i = 0; i < VD55G0_NB_GPIOS; i++) {
++			ret = vd55g0_update_gpio_mode(sensor,
++						      VD55G0_GPIO_MODE_STROBE, i);
++			if (ret)
++				return ret;
++		}
++	}
++
+ 	ret = vd55g0_set_gpios_array(sensor, gpios->out_sync,
+ 				     ARRAY_SIZE(gpios->out_sync),
+ 				     VD55G0_GPIO_MODE_VSYNC_OUT_0);
+ 	if (ret)
+ 		return ret;
+ 
++	{
++		/*
++		 * Strobe/LED timing block copied verbatim (same order) from the
++		 * Windows vd55g0.sys mode tables (Surface Laptop 7 Intel). Not
++		 * written by the ST/linux-surface driver; reset value unknown.
++		 */
++		static const u16 regs[] = { 0x0473, 0x0472, 0x0471, 0x0470,
++					    0x0476, 0x0477, 0x0478, 0x0479 };
++		static const u8 vals[] = { 0xfe, 0x5b, 0x00, 0x08,
++					   0x00, 0x00, 0x00, 0x00 };
++		unsigned int i;
++
++		ret = 0;
++		for (i = 0; i < ARRAY_SIZE(regs); i++)
++			vd55g0_write_reg(sensor, VD55G0_REG_8BIT(regs[i]),
++					 vals[i], &ret);
++		if (ret)
++			return ret;
++	}
++
++	if (sensor->gpio0_raw) {
++		ret = vd55g0_write_reg(sensor, VD55G0_REG_GPIO_0_CTRL,
++				       sensor->gpio0_raw, NULL);
++		if (ret)
++			return ret;
++	}
++
+ 	if (!sensor->is_slave)
+ 		return 0;
+ 
+@@ -1537,6 +1604,20 @@
+ 	case V4L2_CID_PIXEL_RATE:
+ 		ret = __v4l2_ctrl_s_ctrl_int64(ctrl, get_pixel_rate(sensor));
+ 		break;
++	case V4L2_CID_DBG_REG_VAL: {
++		struct device *dev = &sensor->i2c_client->dev;
++		int v;
++
++		if (pm_runtime_get_if_in_use(dev) <= 0)
++			return -ENODATA;	/* sensor off: start a stream first */
++		v = vd55g0_read_reg(sensor, VD55G0_REG_8BIT(sensor->dbg_addr));
++		pm_runtime_put_autosuspend(dev);
++		if (v < 0)
++			return v;
++		ctrl->val = v;
++		ret = 0;
++		break;
++	}
+ 	case V4L2_CID_TEMPERATURE:
+ 		ret = vd55g0_get_temp(sensor, &temperature);
+ 		if (ret)
+@@ -1619,6 +1700,47 @@
+ 	case V4L2_CID_FLASH_LED_MODE:
+ 		ret = vd55g0_update_flash(sensor, ctrl->val);
+ 		break;
++	case V4L2_CID_DBG_REG_ADDR:
++		sensor->dbg_addr = ctrl->val;
++		ret = 0;
++		break;
++	case V4L2_CID_DBG_REG_VAL: {
++		struct device *dev = &sensor->i2c_client->dev;
++
++		if (pm_runtime_get_if_in_use(dev) <= 0)
++			return -ENODATA;
++		ret = vd55g0_write_reg(sensor, VD55G0_REG_8BIT(sensor->dbg_addr),
++				       ctrl->val, NULL);
++		dev_info(dev, "dbg write 0x%04x = 0x%02x (%d)\n",
++			 sensor->dbg_addr, ctrl->val, ret);
++		pm_runtime_put_autosuspend(dev);
++		break;
++	}
++	case V4L2_CID_IR_GPIO0_RAW:
++		sensor->gpio0_raw = ctrl->val;
++		dev_info(&sensor->i2c_client->dev, "GPIO0_CTRL raw 0x%02x\n", ctrl->val);
++		ret = 0;
++		if (sensor->streaming)
++			ret = vd55g0_write_reg(sensor, VD55G0_REG_GPIO_0_CTRL,
++					       ctrl->val ? ctrl->val : 0x01, NULL);
++		break;
++	case V4L2_CID_IR_LED_MASK: {
++		unsigned int i, n = 0;
++
++		/* switch previously selected strobe GPIOs off first */
++		if (sensor->streaming && sensor->flash_en) {
++			sensor->flash_en = false;
++			vd55g0_apply_flash(sensor);
++		}
++		memset(sensor->gpios.leds, ~0, sizeof(sensor->gpios.leds));
++		for (i = 0; i < VD55G0_NB_GPIOS; i++)
++			if (ctrl->val & BIT(i))
++				sensor->gpios.leds[n++] = i;
++		dev_info(&sensor->i2c_client->dev, "IR LED strobe GPIO mask 0x%x\n",
++			 ctrl->val);
++		ret = vd55g0_update_flash(sensor, ctrl->val ? 1 : 0);
++		break;
++	}
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+@@ -1664,6 +1786,41 @@
+ 	.def		= 1,
+ };
+ 
++static const struct v4l2_ctrl_config vd55g0_ir_led_mask_ctrl = {
++	.ops		= &vd55g0_ctrl_ops,
++	.id		= V4L2_CID_IR_LED_MASK,
++	.name		= "IR LED GPIO Mask",
++	.type		= V4L2_CTRL_TYPE_INTEGER,
++	.min		= 0,
++	.max		= 15,
++	.step		= 1,
++	.def		= 0,
++};
++
++static const struct v4l2_ctrl_config vd55g0_ir_gpio0_raw_ctrl = {
++	.ops		= &vd55g0_ctrl_ops,
++	.id		= V4L2_CID_IR_GPIO0_RAW,
++	.name		= "IR GPIO0 Raw",
++	.type		= V4L2_CTRL_TYPE_INTEGER,
++	.min		= 0,
++	.max		= 255,
++	.step		= 1,
++	.def		= 0,
++};
++
++static const struct v4l2_ctrl_config vd55g0_dbg_addr_ctrl = {
++	.ops = &vd55g0_ctrl_ops, .id = V4L2_CID_DBG_REG_ADDR,
++	.name = "Debug Reg Addr", .type = V4L2_CTRL_TYPE_INTEGER,
++	.min = 0, .max = 0xffff, .step = 1, .def = 0,
++};
++
++static const struct v4l2_ctrl_config vd55g0_dbg_val_ctrl = {
++	.ops = &vd55g0_ctrl_ops, .id = V4L2_CID_DBG_REG_VAL,
++	.name = "Debug Reg Value", .type = V4L2_CTRL_TYPE_INTEGER,
++	.min = 0, .max = 0xff, .step = 1, .def = 0,
++	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
++};
++
+ static int vd55g0_init_controls(struct vd55g0_dev *sensor)
+ {
+ 	const struct v4l2_ctrl_ops *ops = &vd55g0_ctrl_ops;
+@@ -1696,6 +1853,10 @@
+ 	ctrl = v4l2_ctrl_new_custom(hdl, &vd55g0_temp_ctrl, NULL);
+ 	ctrl->flags |= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_READ_ONLY;
+ 	v4l2_ctrl_new_custom(hdl, &vd55g0_darkcal_pedestal_ctrl, NULL);
++	v4l2_ctrl_new_custom(hdl, &vd55g0_ir_led_mask_ctrl, NULL);
++	v4l2_ctrl_new_custom(hdl, &vd55g0_ir_gpio0_raw_ctrl, NULL);
++	v4l2_ctrl_new_custom(hdl, &vd55g0_dbg_addr_ctrl, NULL);
++	v4l2_ctrl_new_custom(hdl, &vd55g0_dbg_val_ctrl, NULL);
+ 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_FLASH_LED_MODE,
+ 			       V4L2_FLASH_LED_MODE_FLASH, ~0x7,
+ 			       sensor->flash_en);
+@@ -1804,8 +1965,14 @@
+ 		goto disable_bulk;
+ 	}
+ 
++	if (sensor->powerdown_gpio) {
++		gpiod_set_value_cansleep(sensor->powerdown_gpio, 0);
++		usleep_range(5000, 10000);
++	}
+ 	if (sensor->reset_gpio)
+ 		vd55g0_apply_reset(sensor);
++	else
++		usleep_range(10000, 15000);
+ 
+ 	ret = vd55g0_wait_state(sensor, VD55G0_SYSTEM_FSM_READY_TO_BOOT,
+ 				VD55G0_TIMEOUT_MS);
+@@ -1975,6 +2142,12 @@
+ 	sensor->fmt.field = V4L2_FIELD_NONE;
+ 	sensor->fmt.colorspace = V4L2_COLORSPACE_SRGB;
+ 	sensor->manual_expo = VD55G0_EXPO_DEF;
++	if (ir_emitter) {
++		sensor->expo_state = VD55G0_EXP_MANUAL;
++		sensor->manual_expo = VD55G0_IR_EXPO_DEF;
++		sensor->analog_gain = VD55G0_IR_AGAIN_DEF;
++		sensor->digital_gain = VD55G0_IR_DGAIN_DEF;
++	}
+ 	sensor->vflip = false;
+ 	sensor->hflip = false;
+ 	sensor->darkcal_pedestal = VD55G0_DARKCAL_PEDESTAL_DEF;
+@@ -1985,7 +2158,23 @@
+ 
+ 	sensor->current_mode = &vd55g0_mode_data[VD55G0_DEFAULT_MODE];
+ 
++	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(sensor->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(sensor->reset_gpio), "reset gpio\n");
++	sensor->powerdown_gpio = devm_gpiod_get_optional(dev, "powerdown",
++							 GPIOD_OUT_HIGH);
++	if (IS_ERR(sensor->powerdown_gpio))
++		return dev_err_probe(dev, PTR_ERR(sensor->powerdown_gpio), "powerdown gpio\n");
++	memset(sensor->gpios.leds, ~0, sizeof(sensor->gpios.leds));
++	memset(sensor->gpios.out_sync, ~0, sizeof(sensor->gpios.out_sync));
++	sensor->gpios.in_sync = ~0;
++
+ 	handle = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
++	dev_info(dev, "endpoint %s, reset gpio %s, powerdown gpio %s\n",
++		 handle ? "from ipu-bridge" : "MISSING (fallback)",
++		 sensor->reset_gpio ? "yes" : "no",
++		 sensor->powerdown_gpio ? "yes" : "no");
+ 	if (!handle && ACPI_COMPANION(dev)) {
+ 		/*
+ 		 * ACPI: IPU bridge creates software nodes with endpoint info,
+@@ -2002,9 +2191,6 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+-						     GPIOD_OUT_HIGH);
+-
+ 	/* DT GPIO properties only available with device tree */
+ 	if (dev->of_node) {
+ 		ret = vd55g0_parse_dt_gpios(sensor);
+@@ -2034,6 +2220,7 @@
+ 	}
+ 	if (sensor->xclk) {
+ 		sensor->clk_freq = clk_get_rate(sensor->xclk);
++		dev_info(dev, "external clock %u Hz\n", sensor->clk_freq);
+ 		if (sensor->clk_freq < 6 * HZ_PER_MHZ ||
+ 		    sensor->clk_freq > 27 * HZ_PER_MHZ) {
+ 			dev_err(dev, "Only 6Mhz-27Mhz clock range supported. provide %lu MHz\n",
+@@ -2041,6 +2228,7 @@
+ 			return -EINVAL;
+ 		}
+ 	} else {
++		dev_info(dev, "no external clock provided, assuming 24 MHz\n");
+ 		/* ACPI/INT3472 manages clock externally; default 24MHz */
+ 		sensor->clk_freq = 24 * HZ_PER_MHZ;
+ 	}

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Feed the Surface Laptop 7 front camera (libcamera) into the virtual webcam /dev/video50,
+# so V4L2-only apps (Monologue, etc.) can use it. Started on demand by surface-camera.service.
+exec gst-launch-1.0 -q \
+  libcamerasrc ! queue ! videoconvert ! videoscale ! \
+  video/x-raw,format=YUY2,width=1920,height=1080 ! \
+  v4l2sink device=/dev/video50 sync=false

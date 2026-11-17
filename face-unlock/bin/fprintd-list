@@ -1,0 +1,8 @@
+#!/bin/bash
+# Shim for Omarchy's lock screen: reports the Howdy IR face model as an enrolled "finger".
+U="${1:-$USER}"
+if PAM_USER="$U" /usr/local/bin/surface-faceauth-client status; then
+  printf 'Fingerprints for user %s on Surface IR face camera (press):\n - #0: face\n' "$U"
+else
+  echo "User $U has no fingers enrolled for Surface IR face camera."
+fi

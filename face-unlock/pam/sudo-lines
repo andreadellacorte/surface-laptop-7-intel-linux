@@ -1,0 +1,2 @@
+auth       optional     pam_exec.so quiet /usr/local/bin/surface-faceauth-client precheck
+auth       sufficient   pam_exec.so quiet expose_authtok /usr/local/bin/surface-faceauth-client approve

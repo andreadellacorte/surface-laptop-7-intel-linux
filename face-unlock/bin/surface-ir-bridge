@@ -1,0 +1,27 @@
+#!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+# surface-ir-bridge start [max_seconds] | stop
+# Feeds the IR camera (emitter on) into /dev/video51 for V4L2 apps like Howdy.
+PIDF=/run/surface-ir-bridge.pid
+case "${1:-}" in
+  start)
+    SECS=${2:-15}
+    [ -f $PIDF ] && kill "$(cat $PIDF)" 2>/dev/null
+    setsid timeout "$SECS" gst-launch-1.0 -q \
+      libcamerasrc camera-name='\\_SB_.PC00.I2C3.CAM3' ! queue ! videoconvert ! \
+      videoscale add-borders=false ! video/x-raw,format=GRAY8,width=640,height=600 ! \
+      v4l2sink device=/dev/video51 sync=false >/dev/null 2>&1 &
+    echo $! > $PIDF
+    for i in $(seq 50); do   # up to 5 s for the first frames
+      v4l2-ctl -d /dev/video51 --info 2>/dev/null | sed -n '/Device Caps/,$p' | grep -q 'Video Capture' && break
+      sleep 0.1
+    done
+    SD=$(grep -l vd55g0 /sys/class/video4linux/v4l-subdev*/name 2>/dev/null | head -1)
+    [ -n "$SD" ] && v4l2-ctl -d "/dev/$(basename "$(dirname "$SD")")" -c digital_gain=256 2>/dev/null
+    v4l2-ctl -d /dev/video51 --info 2>/dev/null | sed -n '/Device Caps/,$p' | grep -q 'Video Capture'
+    ;;
+  stop)
+    [ -f $PIDF ] && { pkill -P "$(cat $PIDF)" 2>/dev/null; kill "$(cat $PIDF)" 2>/dev/null; rm -f $PIDF; }
+    ;;
+  *) echo "usage: surface-ir-bridge start [seconds] | stop"; exit 2 ;;
+esac

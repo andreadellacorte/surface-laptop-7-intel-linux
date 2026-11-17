@@ -1,0 +1,6 @@
+[Unit]
+Description=Surface front camera -> virtual webcam (/dev/video50)
+
+[Service]
+ExecStart=%h/.local/bin/surface-camera-bridge
+Restart=no

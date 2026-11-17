@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Surface IR face unlock (Howdy) - started automatically by the Omarchy lock screen
+auth       sufficient   pam_exec.so quiet stdout /usr/local/bin/surface-faceauth-client lock
+auth       required     pam_deny.so
+account    include      system-local-login
